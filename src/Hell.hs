@@ -47,6 +47,7 @@ module Main (main) where
 #if __GLASGOW_HASKELL__ >= 906
 import Control.Monad
 #endif
+import Control.Exception (evaluate)
 import qualified Control.Concurrent as Concurrent
 import Control.Monad.Reader
 import Control.Monad.State.Strict
@@ -144,7 +145,7 @@ commandParser =
 
 -- | Version of Hell.
 hellVersion :: Text
-hellVersion = "2025-01-13"
+hellVersion = "2025-01-21"
 
 -- | Dispatch on the command.
 dispatch :: Command -> IO ()
@@ -153,7 +154,7 @@ dispatch (Run filePath) = do
   action <- compileFile filePath
   eval () action
 dispatch (Check filePath) = do
-  void $ compileFile filePath
+  compileFile filePath >>= void . evaluate
 
 --------------------------------------------------------------------------------
 -- Compiler
@@ -207,13 +208,18 @@ parseModule (HSE.Module _ Nothing [] [] decls) = do
     parseDecl (HSE.PatBind _ (HSE.PVar _ (HSE.Ident _ string)) (HSE.UnGuardedRhs _ exp') Nothing) =
       pure ([(string, exp')], types)
         where types = []
+    parseDecl (HSE.PatBind _ (HSE.PatTypeSig l (HSE.PVar _ (HSE.Ident _ string))
+                                               typ)
+                             (HSE.UnGuardedRhs _ exp') Nothing) =
+      pure ([(string, HSE.ExpTypeSig l exp' typ)], types)
+        where types = []
     parseDecl (HSE.DataDecl _ HSE.DataType {} Nothing (HSE.DHead _ name) [qualConDecl] []) =
       do (termName,termExpr,typeName,typ) <- parseDataDecl name qualConDecl
          pure ([(termName,termExpr)], [(typeName,typ)])
     parseDecl (HSE.DataDecl _ HSE.DataType {} Nothing (HSE.DHead _ name) qualConDecls []) =
       do (terms, tyname, typ) <- parseSumDecl name qualConDecls
          pure (terms, [(tyname,typ)])
-    parseDecl _ = fail "Can't parse that!"
+    parseDecl d = fail $ "Can't parse that! " ++ show d
 parseModule _ = fail "Module headers aren't supported."
 
 -- data Value = Text Text | Number Int
@@ -390,6 +396,7 @@ makeConstructRecord qname fields =
     $ map
       ( \case
           HSE.FieldUpdate _ (HSE.UnQual _ (HSE.Ident _ i)) expr -> (i, expr)
+          HSE.FieldPun _ v@(HSE.UnQual _ (HSE.Ident l' i)) -> (i, HSE.Var l' v)
           f -> error $ "Invalid field: " ++ show f
       )
       fields
@@ -450,6 +457,7 @@ data UTerm t
   = UVar HSE.SrcSpanInfo t String
   | ULam HSE.SrcSpanInfo t Binding (Maybe SomeStarType) (UTerm t)
   | UApp HSE.SrcSpanInfo t (UTerm t) (UTerm t)
+  | USig HSE.SrcSpanInfo t (UTerm t) SomeStarType
   | -- IRep below: The variables are poly types, they aren't metavars,
     -- and need to be instantiated.
     UForall Prim HSE.SrcSpanInfo t [SomeTypeRep] Forall [TH.Uniq] (IRep TH.Uniq) [t]
@@ -460,6 +468,7 @@ typeOf = \case
   UVar _ t _ -> t
   ULam _ t _ _ _ -> t
   UApp _ t _ _ -> t
+  USig _ t _ _ -> t
   UForall _ _ t _ _ _ _ _ -> t
 
 data Binding = Singleton String | Tuple [String]
@@ -506,6 +515,9 @@ data Prim = LitP (HSE.Literal HSE.SrcSpanInfo) | NameP String | UnitP
 
 data SomeStarType = forall (a :: Type). SomeStarType (TypeRep a)
 
+instance Pretty SomeStarType where
+  pretty (SomeStarType a) = pretty a
+
 deriving instance Show SomeStarType
 
 instance Eq SomeStarType where
@@ -534,7 +546,10 @@ data TypeCheckError
   | LambdaIsNotAFunBug
   | InferredCheckedDisagreeBug
   | LambdaMustBeStarBug
+  | ConstraintResolutionProblem HSE.SrcSpanInfo Forall String
   deriving (Show)
+
+instance Show Forall where show = showR
 
 typed :: (Type.Typeable a) => a -> Typed (Term g)
 typed l = Typed (Type.typeOf l) (Lit l)
@@ -550,6 +565,14 @@ check = tc
 
 -- Type check a term given an environment of names.
 tc :: (UTerm SomeTypeRep) -> TyEnv g -> Either TypeCheckError (Typed (Term g))
+tc (USig _l _ e (SomeStarType someStarType)) env = do
+  case tc e env of
+    Left err -> Left err
+    Right typed'@(Typed ty _)
+      | Just {} <- Type.eqTypeRep ty someStarType ->
+        pure typed'
+      | otherwise ->
+        Left TypeCheckMismatch
 tc (UVar _ _ v) env = do
   Typed ty v' <- lookupVar v env
   pure $ Typed ty (Var v')
@@ -585,7 +608,7 @@ tc (UApp _ _ e1 e2) env =
                     _ -> Left TypeCheckMismatch
     Right {} -> Left TypeOfApplicandIsNotFunction
 -- Polytyped terms, must be, syntactically, fully-saturated
-tc (UForall _ _ _ _ fall _ _ reps0) _env = go reps0 fall
+tc (UForall _ forallLoc _ _ fall _ _ reps0) _env = go reps0 fall
   where
     go :: [SomeTypeRep] -> Forall -> Either TypeCheckError (Typed (Term g))
     go [] (Final typed') = pure typed'
@@ -596,7 +619,7 @@ tc (UForall _ _ _ _ fall _ _ reps0) _env = go reps0 fall
       | Just Type.HRefl <- Type.eqTypeRep (typeRepKind rep) (typeRep @Symbol) = go reps (f rep)
     go (SomeTypeRep rep : reps) (StreamTypeOf f)
       | Just Type.HRefl <- Type.eqTypeRep (typeRepKind rep) (typeRep @StreamType) = go reps (f rep)
-    go (StarTypeRep rep : reps) (OrdEqShow f) =
+    go (StarTypeRep rep : reps) fa@(OrdEqShow f) =
       if
           | Just Type.HRefl <- Type.eqTypeRep rep (typeRep @Int) -> go reps (f rep)
           | Just Type.HRefl <- Type.eqTypeRep rep (typeRep @Double) -> go reps (f rep)
@@ -605,8 +628,9 @@ tc (UForall _ _ _ _ fall _ _ reps0) _env = go reps0 fall
           | Just Type.HRefl <- Type.eqTypeRep rep (typeRep @Text) -> go reps (f rep)
           | Just Type.HRefl <- Type.eqTypeRep rep (typeRep @ByteString) -> go reps (f rep)
           | Just Type.HRefl <- Type.eqTypeRep rep (typeRep @ExitCode) -> go reps (f rep)
-          | otherwise -> error $ "[OrdEqShow] type doesn't have enough instances " ++ show rep
-    go (SomeTypeRep rep : reps) (Monadic f) =
+          | otherwise -> problem fa $ "type doesn't have enough instances " ++ show rep
+
+    go (SomeTypeRep rep : reps) fa@(Monadic f) =
       if
           | Just Type.HRefl <- Type.eqTypeRep rep (typeRep @IO) -> go reps (f rep)
           | Just Type.HRefl <- Type.eqTypeRep rep (typeRep @Maybe) -> go reps (f rep)
@@ -615,8 +639,8 @@ tc (UForall _ _ _ _ fall _ _ reps0) _env = go reps0 fall
           | Type.App either' _ <- rep,
             Just Type.HRefl <- Type.eqTypeRep either' (typeRep @Either) ->
               go reps (f rep)
-          | otherwise -> error $ "[Monad] type doesn't have enough instances " ++ show rep
-    go (SomeTypeRep rep : reps) (Applicable f) =
+          | otherwise -> problem fa $ "type doesn't have enough instances " ++ show rep
+    go (SomeTypeRep rep : reps) fa@(Applicable f) =
       if
           | Just Type.HRefl <- Type.eqTypeRep rep (typeRep @IO) -> go reps (f rep)
           | Just Type.HRefl <- Type.eqTypeRep rep (typeRep @Options.Parser) -> go reps (f rep)
@@ -626,8 +650,8 @@ tc (UForall _ _ _ _ fall _ _ reps0) _env = go reps0 fall
           | Type.App either' _ <- rep,
             Just Type.HRefl <- Type.eqTypeRep either' (typeRep @Either) ->
               go reps (f rep)
-          | otherwise -> error $ "[Applicative] type doesn't have enough instances " ++ show rep
-    go (SomeTypeRep rep : reps) (Monoidal f) =
+          | otherwise -> problem fa $ "type doesn't have enough instances " ++ show rep
+    go (SomeTypeRep rep : reps) fa@(Monoidal f) =
       if
           | Type.App either' _ <- rep,
             Just Type.HRefl <- Type.eqTypeRep either' (typeRep @Vector) ->
@@ -639,34 +663,38 @@ tc (UForall _ _ _ _ fall _ _ reps0) _env = go reps0 fall
             Just Type.HRefl <- Type.eqTypeRep either' (typeRep @[]) ->
               go reps (f rep)
           | Just Type.HRefl <- Type.eqTypeRep rep (typeRep @Text) -> go reps (f rep)
-          | otherwise -> error $ "[Monoid] type doesn't have enough instances " ++ show rep
-    go reps (GetOf k0 a0 t0 r0 f) =
+          | otherwise -> problem fa $ "type doesn't have enough instances " ++ show rep
+    go reps fa@(GetOf k0 a0 t0 r0 f) =
       case makeAccessor k0 r0 a0 t0 of
         Just accessor -> go reps (f accessor)
-        Nothing -> error $ "missing field for field access"
-    go reps (SetOf k0 a0 t0 r0 f) =
+        Nothing -> problem fa $ "missing field for field access"
+    go reps fa@(SetOf k0 a0 t0 r0 f) =
       case makeSetter k0 r0 a0 t0 of
         Just accessor -> go reps (f accessor)
-        Nothing -> error $ "missing field for field set"
-    go reps (ModifyOf k0 a0 t0 r0 f) =
+        Nothing -> problem fa $ "missing field for field set"
+    go reps fa@(ModifyOf k0 a0 t0 r0 f) =
       case makeModify k0 r0 a0 t0 of
         Just accessor -> go reps (f accessor)
-        Nothing -> error $ "missing field for field modify"
-    go tys r = error $ "forall type arguments mismatch: " ++ show tys ++ " for " ++ showR r
-      where
-        showR = \case
-          NoClass {} -> "NoClass"
-          SymbolOf {} -> "SymbolOf"
-          StreamTypeOf {} -> "StreamTypeOf"
-          ListOf {} -> "ListOf"
-          OrdEqShow {} -> "OrdEqShow"
-          Monadic {} -> "Monadic"
-          Applicable {} -> "Applicable"
-          Monoidal {} -> "Monoidal"
-          GetOf {} -> "GetOf"
-          SetOf {} -> "SetOf"
-          ModifyOf {} -> "ModifyOf"
-          Final {} -> "Final"
+        Nothing -> problem fa $ "missing field for field modify"
+    go tys r = problem r $ "forall type arguments mismatch: " ++ show tys ++ " for " ++ showR r
+
+    problem :: Forall -> String -> Either TypeCheckError a
+    problem fa = Left . ConstraintResolutionProblem forallLoc fa
+
+showR :: Forall -> String
+showR = \case
+  NoClass {} -> "forall a."
+  SymbolOf {} -> "forall s. s :: Symbol"
+  StreamTypeOf {} -> "forall s. s :: StreamType"
+  ListOf {} -> "forall l. l :: List"
+  OrdEqShow {} -> "forall a. (Ord a, Eq a, Show a)"
+  Monadic {} -> "forall a. Monad a"
+  Applicable {} -> "forall a. Applicative a"
+  Monoidal {} -> "forall a. Monoid a"
+  GetOf {} -> "<record getter>"
+  SetOf {} -> "<record setter>"
+  ModifyOf {} -> "<record modifier>"
+  Final {} -> "<final>"
 
 -- Make a well-typed literal - e.g. @lit Text.length@ - which can be
 -- embedded in the untyped AST.
@@ -737,6 +765,10 @@ desugarExp ::
 desugarExp userDefinedTypeAliases globals = go mempty
   where
     go scope = \case
+      HSE.ExpTypeSig l e ty -> do
+        e' <- go scope e
+        ty' <- desugarStarType userDefinedTypeAliases ty
+        pure $ USig l () e' ty'
       HSE.Case l e alts -> do
         e' <- desugarCase l e alts
         go scope e'
@@ -1164,6 +1196,7 @@ supportedTypeConstructors =
       ("Tree", SomeTypeRep $ typeRep @Tree),
       ("Value", SomeTypeRep $ typeRep @Value),
       ("()", SomeTypeRep $ typeRep @()),
+      ("Handle", SomeTypeRep $ typeRep @IO.Handle),
 
       -- Internal, hidden types
       ("hell:Hell.NilL", SomeTypeRep $ typeRep @('NilL)),
@@ -1653,7 +1686,10 @@ polyLits =
                  -- Process
                  "Process.runProcess" runProcess :: forall a b c. ProcessConfig a b c -> IO ExitCode
                  "Process.runProcess_" runProcess_ :: forall a b c. ProcessConfig a b c -> IO ()
+                 "Process.setStdin" setStdin :: forall stdin stdin' stdout stderr. StreamSpec 'STInput stdin' -> ProcessConfig stdin stdout stderr -> ProcessConfig stdin' stdout stderr
                  "Process.setStdout" setStdout :: forall stdin stdout stdout' stderr. StreamSpec 'STOutput stdout' -> ProcessConfig stdin stdout stderr -> ProcessConfig stdin stdout' stderr
+                 "Process.setStderr" setStderr :: forall stdin stdout stderr stderr'. StreamSpec 'STOutput stderr' -> ProcessConfig stdin stdout stderr -> ProcessConfig stdin stdout stderr'
+                 "Process.nullStream" Process.nullStream :: forall (a :: StreamType). StreamSpec a ()
                  "Process.useHandleClose" useHandleClose :: forall (a :: StreamType). IO.Handle -> StreamSpec a ()
                  "Process.useHandleOpen" useHandleOpen :: forall (a :: StreamType). IO.Handle -> StreamSpec a ()
                  "Process.setWorkingDir" process_setWorkingDir :: forall a b c. Text -> ProcessConfig a b c -> ProcessConfig a b c
@@ -1954,6 +1990,10 @@ elaborate = fmap getEqualities . flip runStateT empty . flip runReaderT mempty .
     getEqualities (term, Elaborate {equalities}) = (term, equalities)
     go :: UTerm () -> ReaderT (Map String (IRep IMetaVar)) (StateT Elaborate (Either ElaborateError)) (UTerm (IRep IMetaVar))
     go = \case
+      USig l () e ty -> do
+        e' <- go e
+        equal l (typeOf e') (fromSomeStarType ty)
+        pure $ e'
       UVar l () string -> do
         env <- ask
         ty <- case Map.lookup string env of
@@ -2099,7 +2139,7 @@ data File = File {
 parseFile :: String -> IO (Either String File)
 parseFile filePath = do
   string <- ByteString.readFile filePath
-  pure $ case HSE.parseModuleWithMode HSE.defaultParseMode {HSE.parseFilename = filePath, HSE.extensions = HSE.extensions HSE.defaultParseMode ++ [HSE.EnableExtension HSE.PatternSignatures, HSE.EnableExtension HSE.DataKinds, HSE.EnableExtension HSE.BlockArguments, HSE.EnableExtension HSE.TypeApplications]} (Text.unpack (dropShebang (Text.decodeUtf8 string))) >>= parseModule of
+  pure $ case HSE.parseModuleWithMode HSE.defaultParseMode {HSE.parseFilename = filePath, HSE.extensions = HSE.extensions HSE.defaultParseMode ++ [HSE.EnableExtension HSE.PatternSignatures, HSE.EnableExtension HSE.DataKinds, HSE.EnableExtension HSE.BlockArguments, HSE.EnableExtension HSE.TypeApplications, HSE.EnableExtension HSE.NamedFieldPuns]} (Text.unpack (dropShebang (Text.decodeUtf8 string))) >>= parseModule of
     HSE.ParseFailed l e -> Left $ "Parse error: " <> HSE.prettyPrint l <> ": " <> e
     HSE.ParseOk file -> Right file
 
@@ -2257,6 +2297,7 @@ instance Pretty (UTerm t) where
   pretty = \case
     UVar _ _ v -> pretty v
     UApp _ _ f x -> "(" <> pretty f <> " " <> pretty x <> ")"
+    USig _ _ f s -> "(" <> pretty f <> " :: " <> pretty s <> ")"
     UForall prim _ _ _ _ _ _ _ -> pretty prim
     ULam _ _ binding _ t ->
       "(\\" <> pretty binding <> " -> " <> pretty t <> ")"
@@ -2329,6 +2370,16 @@ instance Pretty TypeCheckError where
     LambdaIsNotAFunBug -> "BUG: LambdaIsNotAFunBug. Please report."
     InferredCheckedDisagreeBug -> "BUG: Inferred type disagrees with checked type. Please report."
     LambdaMustBeStarBug -> "BUG: Lambda should be of kind *, but isn't. Please report."
+    ConstraintResolutionProblem loc forall' msg ->
+      mconcat $
+        List.intersperse
+          "\n\n"
+          [ "Couldn't resolve constraint",
+            "  " <> pretty (showR forall'),
+            "due to problem",
+            "  " <> pretty msg,
+            "arising from " <> pretty loc
+          ]
 
 instance Pretty DesugarError where
   pretty = \case
